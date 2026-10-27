@@ -1,0 +1,25 @@
+<resources>
+    <string name="app_name">Alex</string>
+    <string name="greeting">Привет! Нажми на кнопку и говори.</string>
+
+    <string name="btn_listen">🎤 Говорить</string>
+    <string name="btn_stop">⏹ Остановить</string>
+
+    <string name="status_idle">Готов слушать</string>
+    <string name="status_listening">Слушаю…</string>
+    <string name="status_nothing_heard">Не расслышал, попробуй ещё раз</string>
+    <string name="status_no_mic">Нужен доступ к микрофону</string>
+    <string name="status_no_tts">Озвучка недоступна на устройстве</string>
+    <string name="status_no_recognizer">Распознавание речи недоступно на устройстве</string>
+    <string name="status_network_error">Проблема с сетью для распознавания</string>
+    <string name="status_error">Произошла ошибка</string>
+
+    <string name="reply_hello">Привет! Чем помочь?</string>
+    <string name="reply_how_are_you">У меня всё отлично, спасибо! А у тебя?</string>
+    <string name="reply_time">Сейчас %1$s</string>
+    <string name="reply_date">Сегодня %1$s</string>
+    <string name="reply_name">Меня зовут Alex, я твой голосовой ассистент.</string>
+    <string name="reply_thanks">Всегда пожалуйста!</string>
+    <string name="reply_bye">Пока! Обращайся.</string>
+    <string name="reply_unknown">Ты сказал: %1$s. Пока я не знаю такой команды.</string>
+</resources>
