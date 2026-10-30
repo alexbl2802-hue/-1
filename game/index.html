@@ -1,0 +1,1046 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Земли Приключений</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: system-ui, "Segoe UI", sans-serif; color: #f4ecd8; }
+  canvas#game { display: block; }
+  .panel { position: fixed; background: rgba(20, 16, 10, 0.55); border: 1px solid rgba(255, 220, 160, 0.25); border-radius: 8px; padding: 10px 14px; pointer-events: none; text-shadow: 0 1px 2px #000; }
+  #help { top: 12px; left: 12px; font-size: 13px; line-height: 1.55; }
+  #help b { color: #ffd479; }
+  #status { top: 12px; left: 50%; transform: translateX(-50%); font-size: 15px; text-align: center; }
+  #minimap { position: fixed; top: 12px; right: 12px; border: 2px solid rgba(255, 220, 160, 0.4); border-radius: 8px; background: #111; }
+  #prompt { bottom: 70px; left: 50%; transform: translateX(-50%); font-size: 18px; display: none; }
+  #prompt kbd { background: #ffd479; color: #2a1d08; border-radius: 4px; padding: 1px 7px; font-weight: bold; }
+  #banner { position: fixed; top: 28%; width: 100%; text-align: center; font-size: 42px; font-weight: 700; letter-spacing: 2px; text-shadow: 0 3px 10px #000; opacity: 0; transition: opacity 0.8s; pointer-events: none; }
+  #banner small { display: block; font-size: 18px; font-weight: 400; letter-spacing: 1px; opacity: 0.85; }
+  #fade { position: fixed; inset: 0; background: #000; opacity: 1; transition: opacity 0.45s; pointer-events: none; }
+  #start { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; background: radial-gradient(ellipse at center, rgba(30,24,14,0.6), rgba(0,0,0,0.85)); cursor: pointer; }
+  #start h1 { font-size: 48px; margin: 0 0 8px; color: #ffd479; text-shadow: 0 3px 12px #000; }
+  #start p { margin: 4px; opacity: 0.9; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+</script>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="help" class="panel">
+  <b>WASD</b> — ходьба &nbsp; <b>Shift</b> — бег<br>
+  <b>Пробел</b> — прыжок &nbsp; <b>E</b> — действие<br>
+  <b>Мышь</b> — камера &nbsp; <b>Колесо</b> — зум<br>
+  <b>Esc</b> — освободить курсор
+</div>
+<div id="status" class="panel"><span id="loc">Долина</span> &nbsp;·&nbsp; Сокровища: <span id="treasure">0</span>/2</div>
+<canvas id="minimap" width="180" height="180"></canvas>
+<div id="prompt" class="panel"></div>
+<div id="banner"></div>
+<div id="fade"></div>
+<div id="start">
+  <h1>Земли Приключений</h1>
+  <p>Исследуй долину, найди два подземелья и сокровища в них.</p>
+  <p style="opacity:.7">Нажми, чтобы начать</p>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ============================================================
+//  Шум и вспомогательные функции
+// ============================================================
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const rand = mulberry32(20261030);
+const perm = new Uint8Array(256);
+{
+  const p = [...Array(256).keys()];
+  for (let i = 255; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); [p[i], p[j]] = [p[j], p[i]]; }
+  perm.set(p);
+}
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const smoothstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const hash2 = (ix, iz) => perm[(perm[ix & 255] + iz) & 255] / 255;
+
+function vnoise(x, z) {
+  const ix = Math.floor(x), iz = Math.floor(z);
+  const fx = x - ix, fz = z - iz;
+  const ux = fx * fx * (3 - 2 * fx), uz = fz * fz * (3 - 2 * fz);
+  const a = hash2(ix, iz), b = hash2(ix + 1, iz), c = hash2(ix, iz + 1), d = hash2(ix + 1, iz + 1);
+  return lerp(lerp(a, b, ux), lerp(c, d, ux), uz) * 2 - 1;
+}
+function fbm(x, z, oct = 5) {
+  let sum = 0, amp = 1, norm = 0;
+  for (let i = 0; i < oct; i++) { sum += vnoise(x, z) * amp; norm += amp; amp *= 0.5; x *= 2.03; z *= 2.03; }
+  return sum / norm;
+}
+function ridged(x, z, oct = 5) {
+  let sum = 0, amp = 1, norm = 0;
+  for (let i = 0; i < oct; i++) { const n = 1 - Math.abs(vnoise(x, z)); sum += n * n * amp; norm += amp; amp *= 0.5; x *= 2.1; z *= 2.1; }
+  return sum / norm;
+}
+
+// ============================================================
+//  Рельеф
+// ============================================================
+const WORLD = 600, HALF = WORLD / 2, SEG = 300, STEP = WORLD / SEG;
+const WATER = 0;
+
+// Подземелья: где на поверхности стоят входы
+const DUNGEON_SITES = [
+  { x: -95, z: 70, r: 12, name: 'Древний склеп' },
+  { x: 45, z: -100, r: 12, name: 'Пещера кристаллов' },
+];
+
+function rawHeight(x, z) {
+  const d = Math.hypot(x, z) / HALF;
+  let h = fbm(x * 0.006 + 10, z * 0.006 - 4, 5) * 11 + 3.5;
+  h += fbm(x * 0.025, z * 0.025, 3) * 1.4;
+  const r = ridged(x * 0.008 + 3, z * 0.008 + 7, 5);
+  // Кольцо гор по краю мира
+  const ring = smoothstep(0.62, 0.95, d);
+  h += ring * (r * r * 75 + 12);
+  // Горный массив на севере
+  const md = Math.hypot(x - 60, z + 165) / 115;
+  const massif = Math.max(0, 1 - md);
+  h += massif * massif * (r * 70 + 25);
+  // Ровная поляна в центре (точка старта)
+  h = lerp(4, h, smoothstep(0.03, 0.14, d));
+  return h;
+}
+for (const s of DUNGEON_SITES) s.h = Math.max(2, rawHeight(s.x, s.z));
+
+function heightFn(x, z) {
+  let h = rawHeight(x, z);
+  for (const s of DUNGEON_SITES) {
+    const w = 1 - smoothstep(s.r * 0.5, s.r, Math.hypot(x - s.x, z - s.z));
+    if (w > 0) h = lerp(h, s.h, w);
+  }
+  return h;
+}
+
+const heights = new Float32Array((SEG + 1) * (SEG + 1));
+for (let j = 0; j <= SEG; j++)
+  for (let i = 0; i <= SEG; i++)
+    heights[j * (SEG + 1) + i] = heightFn(-HALF + i * STEP, -HALF + j * STEP);
+
+function groundAt(x, z) {
+  const fx = clamp((x + HALF) / STEP, 0, SEG - 0.001), fz = clamp((z + HALF) / STEP, 0, SEG - 0.001);
+  const i = Math.floor(fx), j = Math.floor(fz), tx = fx - i, tz = fz - j;
+  const k = j * (SEG + 1) + i;
+  return lerp(lerp(heights[k], heights[k + 1], tx), lerp(heights[k + SEG + 1], heights[k + SEG + 2], tx), tz);
+}
+function normalYAt(x, z) {
+  const e = 1.0;
+  const dx = (groundAt(x + e, z) - groundAt(x - e, z)) / (2 * e);
+  const dz = (groundAt(x, z + e) - groundAt(x, z - e)) / (2 * e);
+  return 1 / Math.sqrt(1 + dx * dx + dz * dz);
+}
+
+// ============================================================
+//  Рендер, сцена, свет
+// ============================================================
+const canvas = document.getElementById('game');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 1500);
+
+const SKY_FOG = new THREE.Fog(0xb9d3e6, 90, 420);
+const CAVE_FOG = new THREE.Fog(0x050407, 6, 42);
+scene.fog = SKY_FOG;
+
+const hemi = new THREE.HemisphereLight(0xcfe6ff, 0x6b5a3a, 1.1);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xfff1d6, 2.6);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -70, right: 70, top: 70, bottom: -70, near: 1, far: 400 });
+sun.shadow.bias = -0.0005;
+sun.shadow.normalBias = 0.04;
+scene.add(sun, sun.target);
+const SUN_OFFSET = new THREE.Vector3(80, 140, 50);
+
+// Небо — градиентная сфера
+const sky = new THREE.Mesh(
+  new THREE.SphereGeometry(1000, 32, 16),
+  new THREE.ShaderMaterial({
+    side: THREE.BackSide, depthWrite: false,
+    uniforms: { top: { value: new THREE.Color(0x3d7fd1) }, bottom: { value: new THREE.Color(0xcfe2ee) } },
+    vertexShader: 'varying vec3 vP; void main(){ vP = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+    fragmentShader: 'uniform vec3 top; uniform vec3 bottom; varying vec3 vP; void main(){ float t = clamp(vP.y*1.6+0.05,0.0,1.0); gl_FragColor = vec4(mix(bottom, top, t),1.0); }',
+  })
+);
+scene.add(sky);
+
+const surface = new THREE.Group();
+scene.add(surface);
+
+const mat = (color, extra = {}) => new THREE.MeshStandardMaterial({ color, roughness: 0.9, flatShading: true, ...extra });
+
+// ============================================================
+//  Поверхность: земля, вода, деревья, камни
+// ============================================================
+{
+  const geo = new THREE.PlaneGeometry(WORLD, WORLD, SEG, SEG);
+  geo.rotateX(-Math.PI / 2);
+  const pos = geo.attributes.position;
+  const colors = new Float32Array(pos.count * 3);
+  const c = new THREE.Color();
+  const sand = new THREE.Color(0xd8c88f), grassA = new THREE.Color(0x5f9a3c), grassB = new THREE.Color(0x3f7a2e),
+    dirt = new THREE.Color(0x7d6a45), rock = new THREE.Color(0x7c776f), rockDark = new THREE.Color(0x5b5650), snow = new THREE.Color(0xf4f7fb);
+  for (let k = 0; k < pos.count; k++) {
+    const h = heights[k];
+    pos.setY(k, h);
+    const x = pos.getX(k), z = pos.getZ(k);
+    const ny = normalYAt(x, z);
+    const n = fbm(x * 0.05, z * 0.05, 3);
+    c.copy(grassA).lerp(grassB, smoothstep(-0.3, 0.4, n));
+    c.lerp(dirt, smoothstep(0.35, 0.7, fbm(x * 0.02 + 50, z * 0.02, 3)) * 0.6);
+    c.lerp(sand, 1 - smoothstep(0.6, 1.6, h));
+    const rockT = 1 - smoothstep(0.72, 0.86, ny);
+    c.lerp(rock.clone().lerp(rockDark, (n + 1) / 2), Math.max(rockT, smoothstep(30, 45, h) * 0.9));
+    c.lerp(snow, smoothstep(52, 62, h + n * 6) * smoothstep(0.55, 0.75, ny));
+    for (const s of DUNGEON_SITES) {
+      const d = Math.hypot(x - s.x, z - s.z);
+      c.lerp(dirt, (1 - smoothstep(4, 9, d)) * 0.7);
+    }
+    colors[k * 3] = c.r; colors[k * 3 + 1] = c.g; colors[k * 3 + 2] = c.b;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geo.computeVertexNormals();
+  const terrain = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95, flatShading: true }));
+  terrain.receiveShadow = true;
+  surface.add(terrain);
+
+  const water = new THREE.Mesh(
+    new THREE.PlaneGeometry(WORLD * 1.6, WORLD * 1.6),
+    new THREE.MeshStandardMaterial({ color: 0x2f7fae, roughness: 0.15, metalness: 0.1, transparent: true, opacity: 0.78 })
+  );
+  water.rotation.x = -Math.PI / 2;
+  water.position.y = WATER;
+  water.receiveShadow = true;
+  surface.add(water);
+}
+
+// Деревья — сетка для столкновений
+const treeGrid = new Map();
+const TG = 8;
+function addObstacle(x, z, r) {
+  const key = Math.floor(x / TG) + ',' + Math.floor(z / TG);
+  if (!treeGrid.has(key)) treeGrid.set(key, []);
+  treeGrid.get(key).push({ x, z, r });
+}
+const treePoints = [];
+{
+  const pines = [], oaks = [];
+  for (let n = 0; n < 9000 && pines.length + oaks.length < 1700; n++) {
+    const x = (rand() * 2 - 1) * (HALF - 10), z = (rand() * 2 - 1) * (HALF - 10);
+    const h = groundAt(x, z);
+    if (h < 1.3 || h > 42) continue;
+    if (normalYAt(x, z) < 0.82) continue;
+    if (Math.hypot(x, z) < 16) continue;
+    if (DUNGEON_SITES.some(s => Math.hypot(x - s.x, z - s.z) < s.r + 3)) continue;
+    const forest = fbm(x * 0.012 + 100, z * 0.012 - 30, 3);
+    if (forest < -0.05 && rand() > 0.08) continue;
+    const t = { x, z, h, s: 0.8 + rand() * 0.6, rot: rand() * Math.PI * 2 };
+    (h > 18 || rand() < 0.45 ? pines : oaks).push(t);
+  }
+  const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), sc = new THREE.Vector3(), p = new THREE.Vector3(), col = new THREE.Color();
+  const make = (geo, material, list, fn) => {
+    const im = new THREE.InstancedMesh(geo, material, list.length);
+    list.forEach((t, i) => {
+      fn(t, i, im);
+      q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), t.rot);
+      m4.compose(p, q, sc);
+      im.setMatrixAt(i, m4);
+    });
+    im.castShadow = true; im.receiveShadow = true;
+    surface.add(im);
+    return im;
+  };
+  const trunkGeo = new THREE.CylinderGeometry(0.22, 0.32, 1, 6); trunkGeo.translate(0, 0.5, 0);
+  const trunkMat = mat(0x6b4a2b);
+  // Ели
+  make(trunkGeo, trunkMat, pines, t => { p.set(t.x, t.h - 0.2, t.z); sc.set(t.s, t.s * 2.4, t.s); });
+  const coneGeo = new THREE.ConeGeometry(1.7, 3.2, 7); coneGeo.translate(0, 1.6, 0);
+  for (const [y, s] of [[1.6, 1.0], [3.0, 0.78], [4.3, 0.55]]) {
+    make(coneGeo, mat(0xffffff), pines, (t, i, im) => {
+      p.set(t.x, t.h + y * t.s, t.z); sc.setScalar(s * t.s);
+      im.setColorAt(i, col.setHSL(0.33 + rand() * 0.04, 0.45, 0.2 + rand() * 0.06));
+    });
+  }
+  // Лиственные
+  make(trunkGeo, trunkMat, oaks, t => { p.set(t.x, t.h - 0.2, t.z); sc.set(t.s * 1.1, t.s * 2.6, t.s * 1.1); });
+  const crownGeo = new THREE.IcosahedronGeometry(1.9, 0);
+  make(crownGeo, mat(0xffffff), oaks, (t, i, im) => {
+    p.set(t.x, t.h + 3.4 * t.s, t.z); sc.set(t.s * 1.15, t.s, t.s * 1.15);
+    im.setColorAt(i, col.setHSL(0.22 + rand() * 0.08, 0.5, 0.3 + rand() * 0.1));
+  });
+  make(crownGeo, mat(0xffffff), oaks, (t, i, im) => {
+    p.set(t.x + 0.6 * t.s, t.h + 4.3 * t.s, t.z - 0.3 * t.s); sc.setScalar(t.s * 0.7);
+    im.setColorAt(i, col.setHSL(0.24 + rand() * 0.08, 0.5, 0.34 + rand() * 0.1));
+  });
+  for (const t of [...pines, ...oaks]) { addObstacle(t.x, t.z, 0.45 * t.s); treePoints.push(t); }
+
+  // Камни
+  const rocks = [];
+  for (let n = 0; n < 3000 && rocks.length < 420; n++) {
+    const x = (rand() * 2 - 1) * (HALF - 5), z = (rand() * 2 - 1) * (HALF - 5);
+    const h = groundAt(x, z);
+    if (h < 0.5 || Math.hypot(x, z) < 12) continue;
+    if (DUNGEON_SITES.some(s => Math.hypot(x - s.x, z - s.z) < s.r)) continue;
+    const big = rand() < 0.3;
+    rocks.push({ x, z, h, s: big ? 1.2 + rand() * 1.6 : 0.3 + rand() * 0.6, rot: rand() * 6.28 });
+  }
+  const rockGeo = new THREE.DodecahedronGeometry(1, 0);
+  make(rockGeo, mat(0xffffff), rocks, (t, i, im) => {
+    p.set(t.x, t.h + t.s * 0.3, t.z); sc.set(t.s * 1.2, t.s * 0.8, t.s);
+    im.setColorAt(i, col.setHSL(0.08, 0.05, 0.38 + rand() * 0.15));
+  });
+  for (const r of rocks) if (r.s > 0.9) addObstacle(r.x, r.z, r.s * 0.95);
+
+  // Трава — кустики
+  const tufts = [];
+  for (let n = 0; n < 20000 && tufts.length < 7000; n++) {
+    const x = (rand() * 2 - 1) * (HALF - 20), z = (rand() * 2 - 1) * (HALF - 20);
+    const h = groundAt(x, z);
+    if (h < 1.4 || h > 30 || normalYAt(x, z) < 0.86) continue;
+    tufts.push({ x, z, h, s: 0.5 + rand() * 0.6, rot: rand() * 6.28 });
+  }
+  const tuftGeo = new THREE.ConeGeometry(0.25, 0.8, 3); tuftGeo.translate(0, 0.35, 0);
+  const tm = make(tuftGeo, mat(0xffffff), tufts, (t, i, im) => {
+    p.set(t.x, t.h, t.z); sc.setScalar(t.s);
+    im.setColorAt(i, col.setHSL(0.24 + rand() * 0.07, 0.55, 0.3 + rand() * 0.12));
+  });
+  tm.castShadow = false;
+}
+
+// Костёр на стартовой поляне
+const campfire = new THREE.Group();
+{
+  const logGeo = new THREE.CylinderGeometry(0.12, 0.12, 1.3, 6);
+  for (let i = 0; i < 5; i++) {
+    const l = new THREE.Mesh(logGeo, mat(0x5a3b20));
+    l.rotation.z = Math.PI / 2 - 0.35; l.rotation.y = (i / 5) * Math.PI * 2;
+    l.position.set(Math.cos(i / 5 * 6.28) * 0.3, 0.25, -Math.sin(i / 5 * 6.28) * 0.3);
+    l.castShadow = true; campfire.add(l);
+  }
+  for (let i = 0; i < 9; i++) {
+    const s = new THREE.Mesh(new THREE.DodecahedronGeometry(0.22, 0), mat(0x777777));
+    s.position.set(Math.cos(i / 9 * 6.28) * 0.85, 0.1, Math.sin(i / 9 * 6.28) * 0.85);
+    campfire.add(s);
+  }
+  const flame = new THREE.Mesh(new THREE.ConeGeometry(0.35, 1.0, 6), new THREE.MeshBasicMaterial({ color: 0xffa233 }));
+  flame.position.y = 0.6; campfire.add(flame);
+  const fireLight = new THREE.PointLight(0xff9a3c, 30, 18, 1.6);
+  fireLight.position.y = 1.2; campfire.add(fireLight);
+  campfire.userData = { flame, light: fireLight };
+  campfire.position.set(4, groundAt(4, 3), 3);
+  surface.add(campfire);
+  addObstacle(4, 3, 1.0);
+}
+
+// Входы в подземелья
+const surfaceEntrances = [];
+DUNGEON_SITES.forEach((s, idx) => {
+  const g = new THREE.Group();
+  const stone = mat(idx === 0 ? 0x8a8478 : 0x6f6a66);
+  const pillarGeo = new THREE.BoxGeometry(1.0, 4.2, 1.0);
+  for (const x of [-1.9, 1.9]) {
+    const p = new THREE.Mesh(pillarGeo, stone); p.position.set(x, 2.1, 0); p.castShadow = true; g.add(p);
+  }
+  const lintel = new THREE.Mesh(new THREE.BoxGeometry(5.2, 0.9, 1.3), stone); lintel.position.y = 4.6; lintel.castShadow = true; g.add(lintel);
+  const dark = new THREE.Mesh(new THREE.PlaneGeometry(2.8, 4.2), new THREE.MeshBasicMaterial({ color: 0x000000 }));
+  dark.position.set(0, 2.1, -0.2); g.add(dark);
+  // Холм/скала за входом
+  const mound = new THREE.Mesh(new THREE.DodecahedronGeometry(6, 1), mat(idx === 0 ? 0x5d7a3a : 0x6d6862));
+  mound.scale.set(1.1, 0.85, 0.9); mound.position.set(0, 1.2, -5.2); mound.castShadow = true; mound.receiveShadow = true; g.add(mound);
+  // Ступени вниз
+  for (let i = 0; i < 3; i++) {
+    const st = new THREE.Mesh(new THREE.BoxGeometry(2.8, 0.2, 0.6), stone);
+    st.position.set(0, 0.1 - i * 0.18, 0.9 - i * 0.6); g.add(st);
+  }
+  // Факелы по бокам
+  for (const x of [-2.7, 2.7]) {
+    const post = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.1, 1.8, 5), mat(0x4a3220)); post.position.set(x, 0.9, 1.0); g.add(post);
+    const fl = new THREE.Mesh(new THREE.ConeGeometry(0.17, 0.45, 5), new THREE.MeshBasicMaterial({ color: 0xffb040 })); fl.position.set(x, 2.0, 1.0); g.add(fl);
+  }
+  const tl = new THREE.PointLight(0xff9a3c, 14, 12, 1.6); tl.position.set(0, 3, 2); g.add(tl);
+  const angle = Math.atan2(-s.x, -s.z); // лицом к центру долины
+  g.rotation.y = angle;
+  g.position.set(s.x, s.h, s.z);
+  surface.add(g);
+  const dir = new THREE.Vector3(Math.sin(angle), 0, Math.cos(angle));
+  // Препятствия: колонны и холм
+  for (const x of [-1.9, 1.9]) {
+    const lp = new THREE.Vector3(x, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), angle);
+    addObstacle(s.x + lp.x, s.z + lp.z, 0.7);
+  }
+  const mp = new THREE.Vector3(0, 0, -5.2).applyAxisAngle(new THREE.Vector3(0, 1, 0), angle);
+  addObstacle(s.x + mp.x, s.z + mp.z, 4.8);
+  surfaceEntrances.push({ site: s, dir, idx, door: new THREE.Vector3(s.x, s.h, s.z).addScaledVector(dir, 1.0) });
+});
+
+// ============================================================
+//  Подземелья
+// ============================================================
+const CELL = 4, WALL_H = 5;
+const DUNGEON_DEFS = [
+  {
+    name: 'Древний склеп', sub: 'Холодный камень и забытые кости', style: 'crypt', y: -300,
+    map: [
+      '#####################',
+      '#S..#.......#.......#',
+      '#...#..T....#...B...#',
+      '#.......P.P.....P...#',
+      '#.T.#.......#.......#',
+      '##.####.#####.#######',
+      '#......T.#.........##',
+      '#.######.#.#######..#',
+      '#.#....#...#.....#.T#',
+      '#.#.B..###.#..C..#..#',
+      '#.#....T...#.....#..#',
+      '#.###.######P...P#..#',
+      '#.....T.............#',
+      '#####################',
+    ],
+  },
+  {
+    name: 'Пещера кристаллов', sub: 'Глубоко под горами что-то мерцает', style: 'cave', y: -600,
+    map: [
+      '########################',
+      '####S..######......#####',
+      '###.....####..K.....####',
+      '##...T...##....##....###',
+      '##......#.....####...###',
+      '###..K.......#####..K..#',
+      '####....###...###......#',
+      '#####..#####.........###',
+      '####...######..T..#..###',
+      '###...K####.....###..###',
+      '##....#####..C...##.T###',
+      '##..T..###K.....######.#',
+      '###......#.....#########',
+      '########################',
+    ],
+  },
+];
+
+function makeTexture(draw, size = 256) {
+  const cv = document.createElement('canvas'); cv.width = cv.height = size;
+  const ctx = cv.getContext('2d'); draw(ctx, size);
+  const t = new THREE.CanvasTexture(cv);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+const r2 = mulberry32(77);
+const speckle = (ctx, s, n, a) => { for (let i = 0; i < n; i++) { const v = Math.floor(r2() * 255); ctx.fillStyle = `rgba(${v},${v},${v},${a})`; ctx.fillRect(r2() * s, r2() * s, 2 + r2() * 3, 2 + r2() * 3); } };
+const brickTex = makeTexture((ctx, s) => {
+  ctx.fillStyle = '#2b2622'; ctx.fillRect(0, 0, s, s);
+  const bh = s / 8, bw = s / 4;
+  for (let row = 0; row < 8; row++) for (let col = -1; col < 5; col++) {
+    const off = row % 2 ? bw / 2 : 0, l = 50 + r2() * 30;
+    ctx.fillStyle = `hsl(30, 8%, ${l}%)`;
+    ctx.fillRect(col * bw + off + 2, row * bh + 2, bw - 4, bh - 4);
+  }
+  speckle(ctx, s, 1500, 0.15);
+});
+const tileTex = makeTexture((ctx, s) => {
+  ctx.fillStyle = '#22201d'; ctx.fillRect(0, 0, s, s);
+  for (let a = 0; a < 2; a++) for (let b = 0; b < 2; b++) {
+    ctx.fillStyle = `hsl(35, 6%, ${38 + r2() * 14}%)`; ctx.fillRect(a * s / 2 + 3, b * s / 2 + 3, s / 2 - 6, s / 2 - 6);
+  }
+  speckle(ctx, s, 1200, 0.18);
+});
+const rockTex = makeTexture((ctx, s) => {
+  ctx.fillStyle = '#4a4550'; ctx.fillRect(0, 0, s, s);
+  speckle(ctx, s, 4000, 0.2);
+  for (let i = 0; i < 40; i++) { ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.beginPath(); ctx.moveTo(r2() * s, r2() * s); ctx.lineTo(r2() * s, r2() * s); ctx.stroke(); }
+});
+
+const dungeons = DUNGEON_DEFS.map((def, di) => buildDungeon(def, di));
+
+function buildDungeon(def, di) {
+  const map = def.map, rows = map.length, cols = map[0].length, Y = def.y;
+  const group = new THREE.Group(); group.visible = false; scene.add(group);
+  const cave = def.style === 'cave';
+  const cellCenter = (i, j) => new THREE.Vector3((i - cols / 2 + 0.5) * CELL, Y, (j - rows / 2 + 0.5) * CELL);
+  const ch = (i, j) => (i < 0 || j < 0 || i >= cols || j >= rows) ? '#' : map[j][i];
+  const solid = (i, j) => ch(i, j) === '#';
+  const floors = [], walls = [], circles = [], torches = [], crystals = [];
+  let start = null, chestCell = null;
+  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+    const c = ch(i, j);
+    if (c === '#') {
+      let edge = false;
+      for (let dj = -1; dj <= 1; dj++) for (let dd = -1; dd <= 1; dd++) if (!solid(i + dd, j + dj)) edge = true;
+      if (edge) walls.push([i, j]);
+      continue;
+    }
+    floors.push([i, j]);
+    if (c === 'S') start = [i, j];
+    if (c === 'C') chestCell = [i, j];
+    if (c === 'T') torches.push([i, j]);
+    if (c === 'P') circles.push({ ...cellCenter(i, j), r: 0.8, kind: 'P' });
+    if (c === 'K') { circles.push({ ...cellCenter(i, j), r: 1.0, kind: 'K' }); crystals.push([i, j]); }
+  }
+
+  const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), sc = new THREE.Vector3(1, 1, 1), p = new THREE.Vector3();
+  const floorTex = (cave ? rockTex : tileTex);
+  const floorGeo = new THREE.PlaneGeometry(CELL, CELL); floorGeo.rotateX(-Math.PI / 2);
+  const floorMesh = new THREE.InstancedMesh(floorGeo, new THREE.MeshStandardMaterial({ map: floorTex, color: cave ? 0x7a7280 : 0xbbb2a6, roughness: 0.95 }), floors.length);
+  const ceilGeo = new THREE.PlaneGeometry(CELL, CELL); ceilGeo.rotateX(Math.PI / 2);
+  const ceilMesh = new THREE.InstancedMesh(ceilGeo, new THREE.MeshStandardMaterial({ map: cave ? rockTex : brickTex, color: cave ? 0x4a4450 : 0x6a625a, roughness: 1 }), floors.length);
+  floors.forEach(([i, j], k) => {
+    const c = cellCenter(i, j);
+    m4.makeTranslation(c.x, Y, c.z); floorMesh.setMatrixAt(k, m4);
+    m4.makeTranslation(c.x, Y + WALL_H + (cave ? 0.6 : 0), c.z); ceilMesh.setMatrixAt(k, m4);
+  });
+  floorMesh.receiveShadow = true;
+  group.add(floorMesh, ceilMesh);
+
+  let wallMesh;
+  if (cave) {
+    const g = new THREE.DodecahedronGeometry(CELL * 0.7, 1);
+    wallMesh = new THREE.InstancedMesh(g, new THREE.MeshStandardMaterial({ map: rockTex, color: 0x8a8296, roughness: 1, flatShading: true }), walls.length * 2);
+    const col = new THREE.Color();
+    walls.forEach(([i, j], k) => {
+      const c = cellCenter(i, j);
+      for (let layer = 0; layer < 2; layer++) {
+        q.setFromEuler(new THREE.Euler(r2() * 6, r2() * 6, r2() * 6));
+        p.set(c.x + (r2() - 0.5) * 0.8, Y + 1.2 + layer * 2.8, c.z + (r2() - 0.5) * 0.8);
+        sc.set(1 + r2() * 0.25, 1 + r2() * 0.3, 1 + r2() * 0.25);
+        m4.compose(p, q, sc); wallMesh.setMatrixAt(k * 2 + layer, m4);
+        wallMesh.setColorAt(k * 2 + layer, col.setHSL(0.72 + r2() * 0.08, 0.08, 0.45 + r2() * 0.15));
+      }
+    });
+    sc.set(1, 1, 1);
+  } else {
+    const g = new THREE.BoxGeometry(CELL, WALL_H, CELL);
+    wallMesh = new THREE.InstancedMesh(g, new THREE.MeshStandardMaterial({ map: brickTex, color: 0xb0a698, roughness: 0.95 }), walls.length);
+    walls.forEach(([i, j], k) => { const c = cellCenter(i, j); m4.makeTranslation(c.x, Y + WALL_H / 2, c.z); wallMesh.setMatrixAt(k, m4); });
+  }
+  group.add(wallMesh);
+
+  // Колонны
+  for (const o of circles.filter(o => o.kind === 'P')) {
+    const col = new THREE.Mesh(new THREE.CylinderGeometry(0.6, 0.7, WALL_H, 8), new THREE.MeshStandardMaterial({ map: brickTex, color: 0xc8beb0, roughness: 0.9 }));
+    col.position.set(o.x, Y + WALL_H / 2, o.z); group.add(col);
+    for (const yy of [0.2, WALL_H - 0.2]) {
+      const cap = new THREE.Mesh(new THREE.BoxGeometry(1.7, 0.4, 1.7), mat(0x8a8276)); cap.position.set(o.x, Y + yy, o.z); group.add(cap);
+    }
+  }
+
+  // Факелы на стенах
+  const flickers = [];
+  for (const [i, j] of torches) {
+    const c = cellCenter(i, j);
+    let d = [[1, 0], [-1, 0], [0, 1], [0, -1]].find(([a, b]) => solid(i + a, j + b)) || [0, 0];
+    const wx = c.x + d[0] * (CELL / 2 - 0.25), wz = c.z + d[1] * (CELL / 2 - 0.25);
+    const stick = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.08, 0.7, 5), mat(0x4a3220));
+    stick.position.set(wx, Y + 2.5, wz); stick.rotation.set(d[1] * 0.4, 0, -d[0] * 0.4); group.add(stick);
+    const fl = new THREE.Mesh(new THREE.ConeGeometry(0.15, 0.4, 5), new THREE.MeshBasicMaterial({ color: 0xffb040 }));
+    fl.position.set(wx - d[0] * 0.15, Y + 3.0, wz - d[1] * 0.15); group.add(fl);
+    const light = new THREE.PointLight(0xff8a30, 22, 16, 1.5);
+    light.position.set(wx - d[0] * 0.8, Y + 3.0, wz - d[1] * 0.8); group.add(light);
+    flickers.push({ light, flame: fl, base: 22, seed: r2() * 100 });
+  }
+
+  // Кристаллы
+  for (const [i, j] of crystals) {
+    const c = cellCenter(i, j);
+    const hue = r2() < 0.5 ? 0.52 : 0.78;
+    const cm = new THREE.MeshStandardMaterial({ color: new THREE.Color().setHSL(hue, 0.8, 0.6), emissive: new THREE.Color().setHSL(hue, 0.9, 0.35), roughness: 0.2, flatShading: true });
+    for (let n = 0; n < 6; n++) {
+      const h = 0.8 + r2() * 1.8;
+      const k = new THREE.Mesh(new THREE.ConeGeometry(0.25 + r2() * 0.15, h, 5), cm);
+      k.position.set(c.x + (r2() - 0.5) * 1.2, Y + h / 2 - 0.1, c.z + (r2() - 0.5) * 1.2);
+      k.rotation.set((r2() - 0.5) * 0.7, r2() * 6, (r2() - 0.5) * 0.7);
+      group.add(k);
+    }
+    const light = new THREE.PointLight(new THREE.Color().setHSL(hue, 0.8, 0.6), 18, 14, 1.5);
+    light.position.set(c.x, Y + 2, c.z); group.add(light);
+    flickers.push({ light, base: 18, seed: r2() * 100, slow: true });
+  }
+
+  // Декор: кости в склепе, сталагмиты в пещере
+  for (const [i, j] of floors) {
+    const c = cellCenter(i, j), t = ch(i, j);
+    if (t === 'B') {
+      const skull = new THREE.Mesh(new THREE.SphereGeometry(0.22, 6, 5), mat(0xe8e0c8)); skull.position.set(c.x + 0.4, Y + 0.2, c.z); group.add(skull);
+      for (let n = 0; n < 5; n++) {
+        const b = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.7, 4), mat(0xddd4bb));
+        b.rotation.set(Math.PI / 2, 0, r2() * 6); b.position.set(c.x + (r2() - 0.5) * 1.5, Y + 0.06, c.z + (r2() - 0.5) * 1.5); group.add(b);
+      }
+    }
+    if (cave && t === '.' && r2() < 0.25) {
+      const h = 0.5 + r2() * 1.2;
+      const st = new THREE.Mesh(new THREE.ConeGeometry(0.18 + r2() * 0.2, h, 5), mat(0x6e6676));
+      st.position.set(c.x + (r2() - 0.5) * 3, Y + WALL_H + 0.6 - h / 2, c.z + (r2() - 0.5) * 3); st.rotation.x = Math.PI; group.add(st);
+    }
+  }
+
+  // Выход (круг света)
+  const sc0 = cellCenter(...start);
+  const exitRing = new THREE.Mesh(new THREE.RingGeometry(0.8, 1.2, 24), new THREE.MeshBasicMaterial({ color: 0x7fd8ff, side: THREE.DoubleSide, transparent: true, opacity: 0.8 }));
+  exitRing.rotation.x = -Math.PI / 2; exitRing.position.set(sc0.x, Y + 0.03, sc0.z); group.add(exitRing);
+  const beam = new THREE.Mesh(new THREE.CylinderGeometry(1.0, 1.0, WALL_H, 16, 1, true), new THREE.MeshBasicMaterial({ color: 0x9fe4ff, transparent: true, opacity: 0.12, side: THREE.DoubleSide, depthWrite: false }));
+  beam.position.set(sc0.x, Y + WALL_H / 2, sc0.z); group.add(beam);
+  const exitLight = new THREE.PointLight(0x9fe4ff, 10, 10, 1.5); exitLight.position.set(sc0.x, Y + 2, sc0.z); group.add(exitLight);
+
+  // Сундук
+  const cc = cellCenter(...chestCell);
+  const chest = new THREE.Group();
+  const wood = mat(0x7a4a22), metal = mat(0xc9a74a, { metalness: 0.6, roughness: 0.4 });
+  const base = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.7, 0.85), wood); base.position.y = 0.35; chest.add(base);
+  const gold = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.1, 0.65), new THREE.MeshStandardMaterial({ color: 0xffd34d, emissive: 0x6a4a00, metalness: 0.8, roughness: 0.3 })); gold.position.y = 0.66; chest.add(gold);
+  const lidPivot = new THREE.Group(); lidPivot.position.set(0, 0.7, -0.42); chest.add(lidPivot);
+  const lid = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.3, 0.85), wood); lid.position.set(0, 0.15, 0.42); lidPivot.add(lid);
+  for (const x of [-0.45, 0.45]) {
+    const band = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.74, 0.88), metal); band.position.set(x, 0.35, 0); chest.add(band);
+    const band2 = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.32, 0.88), metal); band2.position.set(x, 0.15, 0.42); lidPivot.add(band2);
+  }
+  const lock = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.22, 0.06), metal); lock.position.set(0, 0.62, 0.45); chest.add(lock);
+  chest.position.set(cc.x, Y, cc.z);
+  chest.rotation.y = r2() * 0.6 - 0.3;
+  group.add(chest);
+  circles.push({ x: cc.x, z: cc.z, r: 0.75, kind: 'chest' });
+  const chestLight = new THREE.PointLight(0xffc040, 0, 8, 1.5); chestLight.position.set(cc.x, Y + 1.5, cc.z); group.add(chestLight);
+
+  // Направление старта — в сторону свободной клетки
+  const free = [[0, 1], [1, 0], [-1, 0], [0, -1]].find(([a, b]) => !solid(start[0] + a, start[1] + b));
+  return {
+    def, di, group, map, rows, cols, Y, solid, cellCenter, circles, wallMesh, flickers, exitRing,
+    start: sc0, startYaw: Math.atan2(free[0], free[1]),
+    chest: { pos: cc, lidPivot, light: chestLight, opened: false, t: 0 },
+  };
+}
+
+// ============================================================
+//  Герой
+// ============================================================
+function makeHero() {
+  const g = new THREE.Group();
+  const M = c => mat(c, { roughness: 0.8 });
+  const skin = M(0xf1c27d), tunic = M(0x2e6b8a), pants = M(0x5b4632), boots = M(0x3a2a1a), hair = M(0x5a3a1e), belt = M(0x2a1a0a), steel = M(0xc0c8d0);
+  const box = (w, h, d, m, x, y, z, parent = g) => { const b = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m); b.position.set(x, y, z); b.castShadow = true; parent.add(b); return b; };
+  box(0.62, 0.75, 0.36, tunic, 0, 1.25, 0);
+  box(0.64, 0.1, 0.38, belt, 0, 0.92, 0);
+  box(0.66, 0.22, 0.4, tunic, 0, 0.78, 0);
+  const head = new THREE.Group(); head.position.y = 1.85; g.add(head);
+  box(0.42, 0.42, 0.42, skin, 0, 0, 0, head);
+  box(0.46, 0.14, 0.46, hair, 0, 0.21, 0, head);
+  box(0.46, 0.32, 0.1, hair, 0, 0.06, -0.2, head);
+  box(0.07, 0.07, 0.02, M(0x1a1a1a), -0.1, 0.03, 0.215, head);
+  box(0.07, 0.07, 0.02, M(0x1a1a1a), 0.1, 0.03, 0.215, head);
+  // Меч и щит за спиной
+  const blade = box(0.09, 1.05, 0.03, steel, 0, 1.3, -0.24); blade.rotation.z = 0.6;
+  const hilt = box(0.3, 0.07, 0.07, M(0x8a6a2a), 0.27, 1.69, -0.24); hilt.rotation.z = 0.6;
+  const legs = [], arms = [];
+  for (const s of [-1, 1]) {
+    const lp = new THREE.Group(); lp.position.set(0.16 * s, 0.88, 0); g.add(lp);
+    box(0.24, 0.6, 0.26, pants, 0, -0.3, 0, lp);
+    box(0.26, 0.2, 0.34, boots, 0, -0.75, 0.04, lp);
+    legs.push(lp);
+    const ap = new THREE.Group(); ap.position.set(0.42 * s, 1.55, 0); g.add(ap);
+    box(0.2, 0.62, 0.22, tunic, 0, -0.28, 0, ap);
+    box(0.19, 0.17, 0.19, skin, 0, -0.66, 0, ap);
+    arms.push(ap);
+  }
+  g.userData = { legs, arms, head };
+  return g;
+}
+const hero = makeHero();
+scene.add(hero);
+
+// ============================================================
+//  Состояние игры
+// ============================================================
+const state = {
+  mode: -1, // -1 = поверхность, 0/1 = подземелья
+  pos: new THREE.Vector3(0, groundAt(0, 0), 8),
+  vy: 0, onGround: true, facing: Math.PI, walk: 0, speedNow: 0,
+  yaw: 0, pitch: 0.35, dist: 8, treasures: 0, busy: false,
+};
+
+const keys = {};
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'KeyE') interact();
+  if (e.code === 'Space') e.preventDefault();
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+
+let dragging = false;
+canvas.addEventListener('mousedown', () => { dragging = true; if (document.pointerLockElement !== canvas) canvas.requestPointerLock?.(); });
+addEventListener('mouseup', () => { dragging = false; });
+addEventListener('mousemove', e => {
+  if (document.pointerLockElement !== canvas && !dragging) return;
+  state.yaw -= e.movementX * 0.0028;
+  state.pitch = clamp(state.pitch + e.movementY * 0.0028, -0.25, 1.25);
+});
+addEventListener('wheel', e => { state.dist = clamp(state.dist + Math.sign(e.deltaY) * 0.8, 3, 16); });
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+const startEl = document.getElementById('start');
+startEl.addEventListener('click', () => {
+  startEl.remove();
+  canvas.requestPointerLock?.();
+  showBanner('Долина', 'Где-то здесь скрыты два подземелья');
+});
+
+// ============================================================
+//  UI
+// ============================================================
+const promptEl = document.getElementById('prompt'), bannerEl = document.getElementById('banner'), fadeEl = document.getElementById('fade');
+const locEl = document.getElementById('loc'), treasureEl = document.getElementById('treasure');
+let bannerTimer;
+function showBanner(title, sub) {
+  bannerEl.innerHTML = `${title}<small>${sub}</small>`;
+  bannerEl.style.opacity = 1;
+  clearTimeout(bannerTimer);
+  bannerTimer = setTimeout(() => bannerEl.style.opacity = 0, 2800);
+}
+function transition(fn) {
+  state.busy = true;
+  fadeEl.style.opacity = 1;
+  setTimeout(() => { fn(); fadeEl.style.opacity = 0; setTimeout(() => state.busy = false, 300); }, 470);
+}
+requestAnimationFrame(() => fadeEl.style.opacity = 0);
+
+// ============================================================
+//  Переходы между мирами
+// ============================================================
+function setMode(mode) {
+  state.mode = mode;
+  const inside = mode >= 0;
+  surface.visible = !inside; sky.visible = !inside;
+  sun.visible = !inside;
+  scene.fog = inside ? CAVE_FOG : SKY_FOG;
+  scene.background = inside ? new THREE.Color(0x050407) : null;
+  hemi.intensity = inside ? 0.5 : 1.1;
+  hemi.color.set(inside ? 0x6a6a90 : 0xcfe6ff);
+  hemi.groundColor.set(inside ? 0x201810 : 0x6b5a3a);
+  dungeons.forEach((d, i) => d.group.visible = i === mode);
+  heroLight.visible = inside;
+  locEl.textContent = inside ? dungeons[mode].def.name : 'Долина';
+  drawMinimapBase();
+}
+const heroLight = new THREE.PointLight(0xffd9a0, 6, 9, 1.5);
+heroLight.visible = false;
+scene.add(heroLight);
+
+function enterDungeon(idx) {
+  transition(() => {
+    const d = dungeons[idx];
+    setMode(idx);
+    state.pos.set(d.start.x, d.Y, d.start.z);
+    state.vy = 0;
+    state.facing = d.startYaw; state.yaw = d.startYaw + Math.PI; state.pitch = 0.3;
+    state.dist = Math.min(state.dist, 6);
+    camPos.set(0, 0, 0); camInit = false;
+    showBanner(d.def.name, d.def.sub);
+  });
+}
+function exitDungeon() {
+  transition(() => {
+    const e = surfaceEntrances[state.mode];
+    setMode(-1);
+    const p = e.door.clone().addScaledVector(e.dir, 4);
+    state.pos.set(p.x, groundAt(p.x, p.z), p.z);
+    state.vy = 0;
+    state.facing = Math.atan2(e.dir.x, e.dir.z); state.yaw = state.facing + Math.PI;
+    camInit = false;
+    showBanner('Долина', 'Снова под открытым небом');
+  });
+}
+
+// ============================================================
+//  Взаимодействие
+// ============================================================
+function currentInteraction() {
+  if (state.busy) return null;
+  const p = state.pos;
+  if (state.mode < 0) {
+    for (const e of surfaceEntrances) {
+      if (Math.hypot(p.x - e.door.x, p.z - e.door.z) < 3.2)
+        return { text: `<kbd>E</kbd> Войти: ${e.site.name}`, fn: () => enterDungeon(e.idx) };
+    }
+  } else {
+    const d = dungeons[state.mode];
+    if (Math.hypot(p.x - d.start.x, p.z - d.start.z) < 1.6)
+      return { text: '<kbd>E</kbd> Подняться на поверхность', fn: exitDungeon };
+    const c = d.chest;
+    if (!c.opened && Math.hypot(p.x - c.pos.x, p.z - c.pos.z) < 2.0)
+      return { text: '<kbd>E</kbd> Открыть сундук', fn: () => openChest(d) };
+  }
+  return null;
+}
+function interact() { const it = currentInteraction(); if (it) it.fn(); }
+function openChest(d) {
+  d.chest.opened = true;
+  state.treasures++;
+  treasureEl.textContent = state.treasures;
+  showBanner('Сокровище найдено!', state.treasures === 2 ? 'Все сокровища собраны — ты настоящий искатель приключений!' : 'Осталось ещё одно подземелье');
+}
+
+// ============================================================
+//  Движение и столкновения
+// ============================================================
+const PLAYER_R = 0.4;
+function pushOutCircles(p, list) {
+  for (const o of list) {
+    const dx = p.x - o.x, dz = p.z - o.z, d = Math.hypot(dx, dz), min = o.r + PLAYER_R;
+    if (d < min && d > 1e-5) { p.x = o.x + dx / d * min; p.z = o.z + dz / d * min; }
+  }
+}
+function surfaceObstaclesNear(p) {
+  const out = [], cx = Math.floor(p.x / TG), cz = Math.floor(p.z / TG);
+  for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) {
+    const l = treeGrid.get((cx + a) + ',' + (cz + b)); if (l) out.push(...l);
+  }
+  return out;
+}
+function dungeonCollide(d, p) {
+  const fi = p.x / CELL + d.cols / 2 - 0.5, fj = p.z / CELL + d.rows / 2 - 0.5;
+  const ci = Math.round(fi), cj = Math.round(fj);
+  for (let j = cj - 1; j <= cj + 1; j++) for (let i = ci - 1; i <= ci + 1; i++) {
+    if (!d.solid(i, j)) continue;
+    const c = d.cellCenter(i, j);
+    const nx = clamp(p.x, c.x - CELL / 2, c.x + CELL / 2), nz = clamp(p.z, c.z - CELL / 2, c.z + CELL / 2);
+    const dx = p.x - nx, dz = p.z - nz, dist = Math.hypot(dx, dz);
+    if (dist < PLAYER_R) {
+      if (dist > 1e-5) { p.x = nx + dx / dist * PLAYER_R; p.z = nz + dz / dist * PLAYER_R; }
+      else { p.x = c.x + Math.sign(p.x - c.x || 1) * (CELL / 2 + PLAYER_R); }
+    }
+  }
+  pushOutCircles(p, d.circles);
+}
+
+const tmp = new THREE.Vector3();
+function updatePlayer(dt) {
+  let ix = 0, iz = 0;
+  if (keys.KeyW || keys.ArrowUp) iz += 1;
+  if (keys.KeyS || keys.ArrowDown) iz -= 1;
+  if (keys.KeyA || keys.ArrowLeft) ix -= 1;
+  if (keys.KeyD || keys.ArrowRight) ix += 1;
+  if (state.busy) ix = iz = 0;
+  const fwdX = -Math.sin(state.yaw), fwdZ = -Math.cos(state.yaw);
+  const rgtX = Math.cos(state.yaw), rgtZ = -Math.sin(state.yaw);
+  let mx = fwdX * iz + rgtX * ix, mz = fwdZ * iz + rgtZ * ix;
+  const len = Math.hypot(mx, mz);
+  const p = state.pos;
+  const inside = state.mode >= 0;
+  const groundY = inside ? dungeons[state.mode].Y : groundAt(p.x, p.z);
+  const swimming = !inside && groundY < WATER - 1.0;
+  let speed = keys.ShiftLeft || keys.ShiftRight ? 11 : 5.5;
+  if (swimming) speed *= 0.5;
+  if (len > 0) {
+    mx /= len; mz /= len;
+    const target = Math.atan2(mx, mz);
+    let diff = target - state.facing;
+    diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+    state.facing += diff * Math.min(1, dt * 12);
+    const step = speed * dt;
+    if (inside) {
+      p.x += mx * step; p.z += mz * step;
+      dungeonCollide(dungeons[state.mode], p);
+    } else {
+      // Пробуем шаг, затем по осям — чтобы скользить вдоль склонов
+      const tryMove = (dx, dz) => {
+        const nx = clamp(p.x + dx, -HALF + 4, HALF - 4), nz = clamp(p.z + dz, -HALF + 4, HALF - 4);
+        const rise = groundAt(nx, nz) - groundAt(p.x, p.z);
+        const run = Math.hypot(dx, dz) || 1;
+        if (rise / run > 1.25 && !swimming) return false;
+        p.x = nx; p.z = nz; return true;
+      };
+      if (!tryMove(mx * step, mz * step)) { tryMove(mx * step, 0) || tryMove(0, mz * step); }
+      pushOutCircles(p, surfaceObstaclesNear(p));
+    }
+    state.speedNow = lerp(state.speedNow, speed, Math.min(1, dt * 10));
+  } else {
+    state.speedNow = lerp(state.speedNow, 0, Math.min(1, dt * 10));
+  }
+
+  // Вертикаль
+  const floorY = inside ? dungeons[state.mode].Y : Math.max(groundAt(p.x, p.z), swimming ? WATER - 1.1 : -Infinity);
+  if (state.onGround && (keys.Space) && !swimming && !state.busy) { state.vy = 9; state.onGround = false; }
+  state.vy -= 25 * dt;
+  p.y += state.vy * dt;
+  if (inside) p.y = Math.min(p.y, dungeons[state.mode].Y + WALL_H - 2.1);
+  if (p.y <= floorY || (state.onGround && state.vy <= 0 && p.y - floorY < 0.6)) {
+    p.y = floorY; state.vy = 0; state.onGround = true;
+  } else state.onGround = false;
+
+  // Анимация
+  const ud = hero.userData;
+  const moving = state.speedNow > 0.3;
+  state.walk += dt * state.speedNow * 1.6;
+  const amp = moving ? Math.min(1, state.speedNow / 6) * 0.9 : 0;
+  const sw = Math.sin(state.walk);
+  ud.legs[0].rotation.x = state.onGround ? sw * amp : -0.6;
+  ud.legs[1].rotation.x = state.onGround ? -sw * amp : 0.3;
+  ud.arms[0].rotation.x = state.onGround ? -sw * amp * 0.8 : -2.4;
+  ud.arms[1].rotation.x = state.onGround ? sw * amp * 0.8 : -2.4;
+  const bob = moving && state.onGround ? Math.abs(Math.cos(state.walk)) * 0.08 : Math.sin(performance.now() / 600) * 0.015;
+  hero.position.set(p.x, p.y + bob, p.z);
+  hero.rotation.y = state.facing;
+}
+
+// ============================================================
+//  Камера
+// ============================================================
+const camPos = new THREE.Vector3();
+let camInit = false;
+const raycaster = new THREE.Raycaster();
+function updateCamera(dt) {
+  const inside = state.mode >= 0;
+  const tgt = tmp.set(state.pos.x, state.pos.y + 1.7, state.pos.z);
+  let dist = inside ? Math.min(state.dist, 7) : state.dist;
+  const dir = new THREE.Vector3(Math.sin(state.yaw) * Math.cos(state.pitch), Math.sin(state.pitch), Math.cos(state.yaw) * Math.cos(state.pitch));
+  if (inside) {
+    raycaster.set(tgt, dir); raycaster.far = dist;
+    const hit = raycaster.intersectObject(dungeons[state.mode].wallMesh, false)[0];
+    if (hit) dist = Math.max(0.8, hit.distance - 0.4);
+  }
+  const want = tgt.clone().addScaledVector(dir, dist);
+  if (inside) {
+    const d = dungeons[state.mode];
+    want.y = clamp(want.y, d.Y + 0.4, d.Y + WALL_H - 0.3);
+  } else {
+    want.y = Math.max(want.y, groundAt(want.x, want.z) + 0.6, WATER + 0.3);
+  }
+  if (!camInit) { camPos.copy(want); camInit = true; }
+  else camPos.lerp(want, 1 - Math.exp(-dt * 14));
+  camera.position.copy(camPos);
+  camera.lookAt(tgt);
+  // Фонарь «за плечом» — подсвечивает героя со стороны камеры
+  heroLight.position.lerpVectors(tgt, camPos, 0.5).y += 0.8;
+
+  if (!inside) {
+    sky.position.copy(camera.position);
+    sun.position.copy(state.pos).add(SUN_OFFSET);
+    sun.target.position.copy(state.pos);
+  }
+}
+
+// ============================================================
+//  Миникарта
+// ============================================================
+const mm = document.getElementById('minimap'), mctx = mm.getContext('2d');
+const mmBase = document.createElement('canvas'); mmBase.width = mmBase.height = 180;
+function drawMinimapBase() {
+  const ctx = mmBase.getContext('2d'), S = 180;
+  ctx.fillStyle = '#0b0a0c'; ctx.fillRect(0, 0, S, S);
+  if (state.mode < 0) {
+    const img = ctx.createImageData(S, S);
+    for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+      const wx = -HALF + (x + 0.5) / S * WORLD, wz = -HALF + (y + 0.5) / S * WORLD;
+      const h = groundAt(wx, wz), k = (y * S + x) * 4;
+      let c;
+      if (h < WATER) c = [40, 100, 150];
+      else if (h < 1.4) c = [200, 185, 130];
+      else if (h > 52) c = [235, 240, 245];
+      else if (h > 28 || normalYAt(wx, wz) < 0.78) { const v = 110 + h; c = [v, v - 5, v - 12]; }
+      else c = [70 + h * 2, 125 + h, 55];
+      img.data.set([...c, 255], k);
+    }
+    ctx.putImageData(img, 0, 0);
+    ctx.fillStyle = 'rgba(25,60,20,0.55)';
+    for (const t of treePoints) ctx.fillRect((t.x + HALF) / WORLD * S - 0.5, (t.z + HALF) / WORLD * S - 0.5, 1.2, 1.2);
+  } else {
+    const d = dungeons[state.mode], cs = Math.floor(170 / Math.max(d.cols, d.rows));
+    const ox = (S - cs * d.cols) / 2, oy = (S - cs * d.rows) / 2;
+    for (let j = 0; j < d.rows; j++) for (let i = 0; i < d.cols; i++) {
+      const c = d.map[j][i];
+      ctx.fillStyle = c === '#' ? '#1c1a20' : (c === 'K' ? '#5ad2e6' : '#6e665c');
+      ctx.fillRect(ox + i * cs, oy + j * cs, cs, cs);
+    }
+    d.mm = { cs, ox, oy };
+  }
+}
+function drawMinimap() {
+  const S = 180;
+  mctx.drawImage(mmBase, 0, 0);
+  const dot = (x, y, color, r = 4) => { mctx.fillStyle = color; mctx.beginPath(); mctx.arc(x, y, r, 0, 7); mctx.fill(); };
+  let px, py;
+  if (state.mode < 0) {
+    const toMap = (x, z) => [(x + HALF) / WORLD * S, (z + HALF) / WORLD * S];
+    for (const e of surfaceEntrances) { const [x, y] = toMap(e.site.x, e.site.z); dot(x, y, '#000', 5.5); dot(x, y, '#e04a3a', 4); }
+    const [cx, cy] = toMap(campfire.position.x, campfire.position.z); dot(cx, cy, '#ffb040', 2.5);
+    [px, py] = toMap(state.pos.x, state.pos.z);
+  } else {
+    const d = dungeons[state.mode], { cs, ox, oy } = d.mm;
+    const toMap = (x, z) => [ox + (x / CELL + d.cols / 2) * cs, oy + (z / CELL + d.rows / 2) * cs];
+    { const [x, y] = toMap(d.start.x, d.start.z); dot(x, y, '#7fd8ff', 3.5); }
+    if (!d.chest.opened) { const [x, y] = toMap(d.chest.pos.x, d.chest.pos.z); dot(x, y, '#ffd34d', 3.5); }
+    [px, py] = toMap(state.pos.x, state.pos.z);
+  }
+  mctx.save(); mctx.translate(px, py); mctx.rotate(-state.facing + Math.PI);
+  mctx.fillStyle = '#fff'; mctx.strokeStyle = '#000'; mctx.lineWidth = 1.5;
+  mctx.beginPath(); mctx.moveTo(0, -7); mctx.lineTo(5, 5); mctx.lineTo(0, 2); mctx.lineTo(-5, 5); mctx.closePath(); mctx.stroke(); mctx.fill();
+  mctx.restore();
+}
+
+// ============================================================
+//  Главный цикл
+// ============================================================
+setMode(-1);
+const clock = new THREE.Clock();
+function frame() {
+  const dt = Math.min(clock.getDelta(), 0.05), t = clock.elapsedTime;
+  updatePlayer(dt);
+  updateCamera(dt);
+
+  // Огонь и свечение
+  const cf = campfire.userData;
+  cf.light.intensity = 30 * (0.8 + 0.2 * Math.sin(t * 13) * Math.sin(t * 7.3));
+  cf.flame.scale.y = 0.85 + 0.2 * Math.sin(t * 11);
+  if (state.mode >= 0) {
+    const d = dungeons[state.mode];
+    for (const f of d.flickers) {
+      const s = f.slow ? 0.85 + 0.15 * Math.sin(t * 1.5 + f.seed) : 0.8 + 0.2 * Math.sin(t * 12 + f.seed) * Math.sin(t * 7.7 + f.seed);
+      f.light.intensity = f.base * s;
+      if (f.flame) f.flame.scale.y = 0.8 + 0.3 * s;
+    }
+    d.exitRing.rotation.z = t;
+    const c = d.chest;
+    if (c.opened && c.t < 1) {
+      c.t = Math.min(1, c.t + dt * 1.5);
+      c.lidPivot.rotation.x = -1.9 * (1 - Math.pow(1 - c.t, 3));
+      c.light.intensity = 25 * c.t;
+    }
+  }
+
+  const it = currentInteraction();
+  promptEl.style.display = it ? 'block' : 'none';
+  if (it) promptEl.innerHTML = it.text;
+
+  drawMinimap();
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+frame();
+
+window.__game = { state, dungeons, surfaceEntrances, groundAt, normalYAt, enterDungeon, exitDungeon, HALF };
+</script>
+</body>
+</html>
